@@ -14,6 +14,15 @@ package clojure.lang;
 
 import java.io.ObjectStreamException;
 import java.io.Serializable;
+import java.lang.invoke.CallSite;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+import java.lang.invoke.MutableCallSite;
+import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 
@@ -85,6 +94,8 @@ static Keyword nsKey = Keyword.intern(null, "ns");
 //static Keyword tagKey = Keyword.intern(null, "tag");
 
 volatile Object root;
+// [String methodName, WeakReference<CallSite>[], ...]
+public /*TODO public*/ volatile Object[] callsites = null;
 
 volatile boolean dynamic = false;
 transient final AtomicBoolean threadBound;
@@ -262,6 +273,105 @@ final public Object getRawRoot(){
 		return root;
 }
 
+public MethodHandle newMethodHandle(String methodName, MethodType type, boolean isStatic){
+	try {
+		MethodHandles.Lookup lk = MethodHandles.lookup();
+		if (isStatic) {
+			return lk.findStatic(root.getClass(), methodName, type);
+		} else {
+			return lk.findVirtual(root.getClass(), methodName, type).bindTo(root);
+		}
+	} catch (Exception e) {
+		MethodHandle thrower = MethodHandles.throwException(type.returnType(), IllegalArgumentException.class);
+		return MethodHandles.dropArguments(
+			MethodHandles.insertArguments(thrower,0, 
+				new IllegalArgumentException(String.format(
+					"Could not find matching method %s of type %s static=%s on %s", methodName, type, isStatic, root.getClass()),
+					e)),
+			0, type.parameterList());
+	}
+}
+
+private static void arrayRemoveAt(Object[] a, int j){ // TODO Util
+	Object[] a2 = new Object[a.length-1];
+	System.arraycopy(a, 0, a2, 0, j);
+	System.arraycopy(a, j+1, a2, j, a.length-j-1);
+	a = a2;
+}
+
+public CallSite getCallSite(String methodName, MethodType methodType, boolean isStatic){
+	int methodIdx = -1;
+	if (callsites != null) {
+		for (int i=0; i < callsites.length; i+=2) {
+			String name = (String)callsites[i];
+			if (name == methodName) {
+				methodIdx = i;
+				break;
+			}
+		}
+	}
+	if (methodIdx == -1) {
+		if (callsites == null) {
+			methodIdx = 0;
+			callsites = new Object[2];
+		} else {
+			methodIdx = callsites.length;
+			callsites = Arrays.copyOf(callsites, callsites.length+2);
+		}
+		callsites[methodIdx] = methodName;
+		callsites[methodIdx+1] = new WeakReference[0];
+	}
+
+	WeakReference<CallSite>[] methodSites = (WeakReference<CallSite>[])callsites[methodIdx+1];
+	CallSite callsite = null;
+	for (int j=0; j < methodSites.length; j++) {
+		CallSite site = methodSites[j].get();
+		if (site == null) {
+			arrayRemoveAt(methodSites, j);
+			j--;
+		} else if (methodType.equals(site.type())) {
+			callsite = site;
+			break;
+		}
+	}
+	if (callsite==null) {
+		callsite = new MutableCallSite(newMethodHandle(methodName, methodType, isStatic));
+		methodSites = Arrays.copyOf(methodSites, methodSites.length+1);
+		methodSites[methodSites.length-1] = new WeakReference<CallSite>(callsite);
+		callsites[methodIdx+1] = methodSites;
+	}
+	return callsite;
+}
+
+public void refreshCallSites(){
+	if (callsites == null)
+		return;
+	ArrayList<MutableCallSite> liveSites = new ArrayList<MutableCallSite>();
+	for (int i=0; i < callsites.length; i+=2){
+		String name = (String)callsites[i];
+		WeakReference<MutableCallSite>[] methodSites = (WeakReference<MutableCallSite>[])callsites[i+1];
+		for (int j=0; j < methodSites.length; j++){
+			MutableCallSite site = methodSites[j].get();
+			if (site==null){
+				arrayRemoveAt(methodSites, j);
+				j--;
+			} else {
+				MethodHandle m = newMethodHandle(name, site.type(), false); // TODO not false
+				site.setTarget(m);
+				liveSites.add(site);
+			}
+		}
+		if (methodSites.length==0) {
+			Object[] callsites2 = new Object[callsites.length-2];
+			System.arraycopy(callsites, 0, callsites2, 0, i);
+			System.arraycopy(callsites, i+2, callsites2, i, callsites.length-i-2);
+			callsites = callsites2;
+		}
+	}
+	MutableCallSite[] mcss = new MutableCallSite[liveSites.size()];
+	MutableCallSite.syncAll(liveSites.toArray(mcss));
+}
+
 public Object getTag(){
 	return meta().valAt(RT.TAG_KEY);
 }
@@ -281,6 +391,7 @@ synchronized public void bindRoot(Object root){
 	this.root = root;
 	++rev;
         alterMeta(dissoc, RT.list(macroKey));
+    refreshCallSites();
     notifyWatches(oldroot,this.root);
 }
 
@@ -289,12 +400,14 @@ synchronized void swapRoot(Object root){
 	Object oldroot = this.root;
 	this.root = root;
 	++rev;
+	refreshCallSites();
     notifyWatches(oldroot,root);
 }
 
 synchronized public void unbindRoot(){
 	this.root = new Unbound(this);
 	++rev;
+	refreshCallSites();
 }
 
 synchronized public void commuteRoot(IFn fn) {
@@ -303,6 +416,7 @@ synchronized public void commuteRoot(IFn fn) {
 	Object oldroot = root;
 	this.root = newRoot;
 	++rev;
+	refreshCallSites();
     notifyWatches(oldroot,newRoot);
 }
 
@@ -312,6 +426,7 @@ synchronized public Object alterRoot(IFn fn, ISeq args) {
 	Object oldroot = root;
 	this.root = newRoot;
 	++rev;
+	refreshCallSites();
     notifyWatches(oldroot,newRoot);
 	return newRoot;
 }

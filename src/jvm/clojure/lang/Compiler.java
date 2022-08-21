@@ -19,6 +19,11 @@ import clojure.asm.commons.GeneratorAdapter;
 import clojure.asm.commons.Method;
 
 import java.io.*;
+import java.lang.invoke.CallSite;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+import java.lang.invoke.MutableCallSite;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Modifier;
 import java.util.*;
@@ -186,6 +191,12 @@ static
 	a[MAX_POSITIONAL_ARITY] = Type.getType("[Ljava/lang/Object;");
 	ARG_TYPES[MAX_POSITIONAL_ARITY + 1] = a;
 
+	try { // TODO store descriptor instead?
+		bootstrapVarDynamicInvokeMethod = Compiler.class.getDeclaredMethod("bootstrapVarDynamicInvoke",
+			MethodHandles.Lookup.class, String.class, MethodType.class, String.class, String.class, Integer.class);
+	} catch (Exception e) {
+		throw new RuntimeException("Could not find bootstrapVarDynamicInvoke");
+	}
 
 	}
 
@@ -1441,6 +1452,26 @@ static abstract class MethodExpr extends HostExpr{
 	}
 }
 
+static java.lang.reflect.Method bootstrapVarDynamicInvokeMethod;
+
+public static CallSite bootstrapVarDynamicInvoke(MethodHandles.Lookup lk, String methodName, MethodType type, String ns, String name, Integer isStatic) {
+	// System.out.println(">>  isStatic");
+	// System.out.println(isStatic);
+	Namespace namespace = Namespace.find(Symbol.intern(null, ns));
+	if (namespace != null) {
+		Var v = namespace.findInternedVar(Symbol.intern(null, name));
+		if (v != null) {
+			return v.getCallSite(methodName, type, isStatic > 0);
+		}
+	}
+	MethodHandle thrower = MethodHandles.throwException(type.returnType(), IllegalStateException.class);
+	MethodHandle m = MethodHandles.dropArguments(
+		MethodHandles.insertArguments(thrower,0, 
+			new IllegalStateException(String.format("Could not resolve var %s/%s", ns, name))),
+		0, type.parameterList());
+	return new MutableCallSite(m);
+}
+
 static class InstanceMethodExpr extends MethodExpr{
 	public final Expr target;
 	public final String methodName;
@@ -1579,10 +1610,14 @@ static class InstanceMethodExpr extends MethodExpr{
 	public void emit(C context, ObjExpr objx, GeneratorAdapter gen){
 		if(method != null)
 			{
+			boolean isVarRoot = target instanceof VarExpr &&
+			                    !((VarExpr)target).var.isDynamic();
 			Type type = Type.getType(method.getDeclaringClass());
-			target.emit(C.EXPRESSION, objx, gen);
-			//if(!method.getDeclaringClass().isInterface())
-			gen.checkCast(type);
+			if (!isVarRoot) {
+				target.emit(C.EXPRESSION, objx, gen);
+				//if(!method.getDeclaringClass().isInterface())
+				gen.checkCast(type);
+			}
 			MethodExpr.emitTypedArgs(objx, gen, method.getParameterTypes(), args);
 			gen.visitLineNumber(line, gen.mark());
 			if(context == C.RETURN)
@@ -1590,11 +1625,25 @@ static class InstanceMethodExpr extends MethodExpr{
 				ObjMethod method = (ObjMethod) METHOD.deref();
 				method.emitClearLocals(gen);
 				}
-			Method m = new Method(methodName, Type.getReturnType(method), Type.getArgumentTypes(method));
-			if(method.getDeclaringClass().isInterface())
-				gen.invokeInterface(type, m);
-			else
-				gen.invokeVirtual(type, m);
+			if (isVarRoot) {
+				// System.out.println("ON VAR");
+				VarExpr ve = (VarExpr) target;
+				Symbol varsym = ve.var.toSymbol();
+				// System.out.println(varsym);
+				// System.out.println(line);
+				gen.invokeDynamic(methodName,Type.getMethodDescriptor(method),
+					new Handle(Opcodes.H_INVOKESTATIC, "clojure/lang/Compiler", 
+						"bootstrapVarDynamicInvoke", 
+						Type.getMethodDescriptor(bootstrapVarDynamicInvokeMethod),
+						false),
+					varsym.ns, varsym.name, 0);
+			} else {
+				Method m = new Method(methodName, Type.getReturnType(method), Type.getArgumentTypes(method));
+				if(method.getDeclaringClass().isInterface())
+					gen.invokeInterface(type, m);
+				else
+					gen.invokeVirtual(type, m);
+			}
 			Class retClass = method.getReturnType();
 			if(context == C.STATEMENT)
 				{
@@ -3454,6 +3503,36 @@ public static class InstanceOfExpr implements Expr, MaybePrimitiveExpr{
 
 }
 
+// static java.lang.reflect.Method findStaticInvokeMethod(Class c, int argcount) {
+// 	java.lang.reflect.Method[] allmethods = c.getMethods();
+
+// 	boolean variadic = false;
+// 	java.lang.reflect.Method method = null;
+// 	for(java.lang.reflect.Method m : allmethods)
+// 		{
+// 		//System.out.println(m);
+// 		if(Modifier.isStatic(m.getModifiers()) && m.getName().equals("invokeStatic"))
+// 			{
+// 			Class[] params = m.getParameterTypes();
+// 			if(argcount == params.length)
+// 				{
+// 				method = m;
+// 				variadic = argcount > 0 && params[params.length-1] == ISeq.class;
+// 				break;
+// 				}
+// 			else if(argcount > params.length
+// 					&& params.length > 0
+// 					&& params[params.length-1] == ISeq.class)
+// 				{
+// 				method = m;
+// 				variadic = true;
+// 				break;
+// 				}
+// 			}
+// 		}
+// 	return method;
+// }
+
 static class StaticInvokeExpr implements Expr, MaybePrimitiveExpr{
 	public final Type target;
 	public final Class retClass;
@@ -3555,10 +3634,11 @@ static class StaticInvokeExpr implements Expr, MaybePrimitiveExpr{
 		String cname = c.getName();
 //		System.out.println("Class: " + cname);
 
+		int argcount = RT.count(args);
+		// java.lang.reflect.Method method = findStaticInvokeMethod(c, argcount);
 		java.lang.reflect.Method[] allmethods = c.getMethods();
 
 		boolean variadic = false;
-		int argcount = RT.count(args);
 		java.lang.reflect.Method method = null;
 		for(java.lang.reflect.Method m : allmethods)
 			{
@@ -3712,12 +3792,19 @@ static class InvokeExpr implements Expr{
 			emitProto(context,objx,gen);
 			}
 
-		else
+		else if (fexpr instanceof VarExpr && !((VarExpr)fexpr).var.isDynamic())
+			{
+			gen.visitLineNumber(line, gen.mark());
+			emitArgs(0, context,objx,gen);
+			emitVarCall(gen);
+			}
+		else 
 			{
 			fexpr.emit(C.EXPRESSION, objx, gen);
 			gen.visitLineNumber(line, gen.mark());
 			gen.checkCast(IFN_TYPE);
-			emitArgsAndCall(0, context,objx,gen);
+			emitArgs(0, context,objx,gen);
+			emitCall(gen);
 			}
 		if(context == C.STATEMENT)
 			gen.pop();		
@@ -3748,10 +3835,12 @@ static class InvokeExpr implements Expr{
 		gen.putStatic(objx.objtype, objx.cachedClassName(siteIndex),CLASS_TYPE); //target
 
 		gen.mark(callLabel); //target
-		objx.emitVar(gen, v);
-		gen.invokeVirtual(VAR_TYPE, Method.getMethod("Object getRawRoot()")); //target, proto-fn
-		gen.swap();
-		emitArgsAndCall(1, context,objx,gen);
+		// objx.emitVar(gen, v);
+		// gen.invokeVirtual(VAR_TYPE, Method.getMethod("Object getRawRoot()")); //target, proto-fn
+		// gen.swap();
+		emitArgs(1, context,objx,gen);
+		emitVarCall(gen);
+		// emitCall(gen);
 		gen.goTo(endLabel);
 
 		gen.mark(onLabel); //target
@@ -3771,7 +3860,7 @@ static class InvokeExpr implements Expr{
 		gen.mark(endLabel);
 	}
 
-	void emitArgsAndCall(int firstArgToEmit, C context, ObjExpr objx, GeneratorAdapter gen){
+	void emitArgs(int firstArgToEmit, C context, ObjExpr objx, GeneratorAdapter gen){
 		for(int i = firstArgToEmit; i < Math.min(MAX_POSITIONAL_ARITY, args.count()); i++)
 			{
 			Expr e = (Expr) args.nth(i);
@@ -3793,9 +3882,69 @@ static class InvokeExpr implements Expr{
 			ObjMethod method = (ObjMethod) METHOD.deref();
 			method.emitClearThis(gen);
 			}
+	}
 
+	void emitCall(GeneratorAdapter gen) {
 		gen.invokeInterface(IFN_TYPE, new Method("invoke", OBJECT_TYPE, ARG_TYPES[Math.min(MAX_POSITIONAL_ARITY + 1,
 		                                                                                   args.count())]));
+	}
+
+	void emitVarCall(GeneratorAdapter gen) {
+		Var v = ((VarExpr)fexpr).var;
+		Symbol varsym = v.toSymbol();
+		// System.out.println("VARCALL");
+		// System.out.println(varsym);
+		// System.out.println(line);
+
+
+		Class c = v.getRawRoot().getClass();
+		java.lang.reflect.Method[] allmethods = c.getMethods();
+
+		int argcount = args.count();
+		boolean variadic = false;
+		java.lang.reflect.Method smethod = null;
+		for(java.lang.reflect.Method m : allmethods)
+			{
+			//System.out.println(m);
+			if(Modifier.isStatic(m.getModifiers()) && m.getName().equals("invokeStatic"))
+				{
+				Class[] params = m.getParameterTypes();
+				if(argcount == params.length)
+					{
+					smethod = m;
+					variadic = argcount > 0 && params[params.length-1] == ISeq.class;
+					break;
+					}
+				else if(argcount > params.length
+						&& params.length > 0
+						&& params[params.length-1] == ISeq.class)
+					{
+					smethod = m;
+					variadic = true;
+					break;
+					}
+				}
+			}
+
+		if (smethod == null || variadic){ // TODO variadic
+			gen.invokeDynamic("invoke",
+				Type.getMethodDescriptor(OBJECT_TYPE, ARG_TYPES[Math.min(MAX_POSITIONAL_ARITY + 1,
+			                                                             args.count())]),
+				new Handle(Opcodes.H_INVOKESTATIC, "clojure/lang/Compiler", 
+					"bootstrapVarDynamicInvoke", 
+					Type.getMethodDescriptor(bootstrapVarDynamicInvokeMethod),
+					false),
+				varsym.ns, varsym.name, 0);
+		}
+		else {
+			gen.invokeDynamic("invokeStatic",
+				Type.getMethodDescriptor(smethod),
+				new Handle(Opcodes.H_INVOKESTATIC, "clojure/lang/Compiler", 
+					"bootstrapVarDynamicInvoke", 
+					Type.getMethodDescriptor(bootstrapVarDynamicInvokeMethod),
+					false),
+				varsym.ns, varsym.name, 1);
+		}
 	}
 
 	public boolean hasJavaClass() {
